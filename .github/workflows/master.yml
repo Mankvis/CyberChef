@@ -55,6 +55,10 @@ jobs:
         if: success()
         run: npx grunt copy:ghPages
 
+      - name: Add CNAME for custom domain
+        if: success()
+        run: echo "encode.1996.pro" > ./build/prod/CNAME
+
       - name: Deploy to GitHub Pages
         if: success() && github.ref == 'refs/heads/master'
         uses: crazy-max/ghaction-github-pages@v3
