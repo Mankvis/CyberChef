@@ -1,0 +1,127 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git (avoid GITHUB_TOKEN override)
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync@users.noreply.github.com"
+          git config credential.helper ""
+          git config --unset-all http.https://github.com/.extraheader || true
+          git config --unset-all http.https://github.com/.extraheader || true
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/gchq/CyberChef.git
+          git fetch upstream
+
+      - name: Check for updates
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+
+          echo "Local:    $LOCAL"
+          echo "Upstream: $REMOTE"
+
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Backup local sync workflow
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          mkdir -p /tmp/backup
+          cp .github/workflows/sync-upstream.yml /tmp/backup/ || true
+
+      - name: Hard reset to upstream
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git checkout master
+          git reset --hard upstream/master
+
+      - name: Restore local sync workflow
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/backup/sync-upstream.yml .github/workflows/ || true
+
+      - name: Patch master workflow to include CNAME in build output
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          path = pathlib.Path(".github/workflows/master.yml")
+          if not path.exists():
+            print("master.yml not found, skipping patch")
+            sys.exit(0)
+
+          text = path.read_text(encoding="utf-8")
+
+          # Already patched?
+          if "Add CNAME for custom domain" in text or "./build/prod/CNAME" in text:
+            print("CNAME step already present, no patch needed")
+            sys.exit(0)
+
+          needle = (
+            "      - name: Prepare for GitHub Pages\n"
+            "        if: success()\n"
+            "        run: npx grunt copy:ghPages\n"
+          )
+
+          insert = needle + "\n" + (
+            "      - name: Add CNAME for custom domain\n"
+            "        if: success()\n"
+            "        run: echo \"encode.1996.pro\" > ./build/prod/CNAME\n"
+          )
+
+          if needle not in text:
+            print("Prepare for GitHub Pages block not found; cannot patch safely.")
+            sys.exit(1)
+
+          path.write_text(text.replace(needle, insert, 1), encoding="utf-8")
+          print("Patched master.yml with CNAME step")
+          PY
+
+      - name: Commit changes (if any)
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git add .github/workflows/master.yml .github/workflows/sync-upstream.yml || true
+          git diff --cached --quiet || git commit -m "Sync upstream + patch Pages CNAME"
+
+      - name: Push using PAT
+        if: steps.check.outputs.changed == 'true'
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_USER: "Mankvis"
+        run: |
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "PAT_TOKEN is empty. Check repository Secrets (Actions)."
+            exit 1
+          fi
+
+          # Ensure PAT auth is used (avoid checkout header)
+          git config --unset-all http.https://github.com/.extraheader || true
+          git config credential.helper ""
+
+          git push "https://${GH_USER}:${PAT_TOKEN}@github.com/${{ github.repository }}.git" master --force
