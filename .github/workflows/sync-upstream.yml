@@ -1,0 +1,133 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure Git (avoid GITHUB_TOKEN override)
+        run: |
+          git config user.name "sync-bot"
+          git config user.email "sync@users.noreply.github.com"
+          git config credential.helper ""
+          git config --unset-all http.https://github.com/.extraheader || true
+          git config --unset-all http.https://github.com/.extraheader || true
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/gchq/CyberChef.git
+          git fetch upstream
+
+      - name: Check for updates
+        id: check
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          REMOTE=$(git rev-parse upstream/master)
+
+          echo "Local:    $LOCAL"
+          echo "Upstream: $REMOTE"
+
+          # The fork commit includes local workflow changes, so it will not
+          # normally have the same SHA as upstream even when it is up to date.
+          # Treat upstream as current when its tip is already in local history.
+          if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Backup local sync workflow
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          mkdir -p /tmp/backup
+          cp .github/workflows/sync-upstream.yml /tmp/backup/ || true
+
+      - name: Hard reset to upstream
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git checkout master
+          git reset --hard upstream/master
+
+      - name: Restore local sync workflow
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/backup/sync-upstream.yml .github/workflows/ || true
+
+      - name: Patch master workflow to include CNAME in build output
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          path = pathlib.Path(".github/workflows/master.yml")
+          if not path.exists():
+            print("master.yml not found, skipping patch")
+            sys.exit(0)
+
+          text = path.read_text(encoding="utf-8")
+
+          # Already patched?
+          if "Add CNAME for custom domain" in text or "./build/prod/CNAME" in text:
+            print("CNAME step already present, no patch needed")
+            sys.exit(0)
+
+          # Insert immediately before the Pages deployment step. Anchoring on
+          # the deployment step keeps this independent of upstream changes to
+          # the preceding build/preparation steps.
+          deploy_step = re.search(
+            r"(?m)^(?P<indent>[ \\t]*)- name: Deploy to GitHub Pages[ \\t]*$",
+            text,
+          )
+          if not deploy_step:
+            print("Deploy to GitHub Pages step not found; cannot patch safely.")
+            sys.exit(1)
+
+          indent = deploy_step.group("indent")
+          insert = (
+            f'{indent}- name: Add CNAME for custom domain\n'
+            f'{indent}  if: success()\n'
+            f'{indent}  run: echo "encode.1996.pro" > ./build/prod/CNAME\n\n'
+          )
+
+          patched = text[:deploy_step.start()] + insert + text[deploy_step.start():]
+          path.write_text(patched, encoding="utf-8")
+          print("Patched master.yml with CNAME step")
+          PY
+
+      - name: Commit changes (if any)
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git add .github/workflows/master.yml .github/workflows/sync-upstream.yml || true
+          git diff --cached --quiet || git commit -m "Sync upstream + patch Pages CNAME"
+
+      - name: Push using PAT
+        if: steps.check.outputs.changed == 'true'
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_USER: "Mankvis"
+        run: |
+          if [ -z "$PAT_TOKEN" ]; then
+            echo "PAT_TOKEN is empty. Check repository Secrets (Actions)."
+            exit 1
+          fi
+
+          # Ensure PAT auth is used (avoid checkout header)
+          git config --unset-all http.https://github.com/.extraheader || true
+          git config credential.helper ""
+
+          git push "https://${GH_USER}:${PAT_TOKEN}@github.com/${{ github.repository }}.git" master --force
